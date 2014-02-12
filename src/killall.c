@@ -2,7 +2,7 @@
  * killall.c - kill processes by name or list PIDs
  *
  * Copyright (C) 1993-2002 Werner Almesberger
- * Copyright (C) 2002-2007 Craig Small
+ * Copyright (C) 2002-2012 Craig Small
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -80,11 +80,9 @@
 #define ER_UNKWN   -3
 #define ER_OOFRA   -4
 
-#define NOT_PIDOF_OPTION if (pidof) usage(NULL)
-
 static int verbose = 0, exact = 0, interactive = 0, reg = 0,
            quiet = 0, wait_until_dead = 0, process_group = 0,
-           ignore_case = 0, pidof;
+           ignore_case = 0;
 static long younger_than = 0, older_than = 0;
 
 static int
@@ -130,19 +128,19 @@ uptime()
    char buf[2048];
    FILE* file;
    if (!(file=fopen( PROC_BASE "/uptime", "r"))) {
-      fprintf(stderr, "error opening uptime file\n");	
+      fprintf(stderr, "killall: error opening uptime file\n");	
       exit(1);
    }
    savelocale = setlocale(LC_NUMERIC, NULL);
    setlocale(LC_NUMERIC,"C");
-   fscanf(file, "%s", buf);
+   if (fscanf(file, "%2047s", buf) == EOF) perror("uptime");
    fclose(file);
    setlocale(LC_NUMERIC,savelocale);
    return atof(buf);
 }
 
 /* process age from jiffies to seconds via uptime */
-static double process_age(const unsigned jf)
+static double process_age(const unsigned long long jf)
 {
    double sc_clk_tck = sysconf(_SC_CLK_TCK);
    assert(sc_clk_tck > 0);
@@ -206,7 +204,7 @@ match_process_uid(pid_t pid, uid_t uid)
 	fclose(f);
 	if (re==-1)
 	{
-		fprintf(stderr, _("Cannot get UID from process status\n"));
+		fprintf(stderr, _("killall: Cannot get UID from process status\n"));
 		exit(1);
 	}
 	return re;
@@ -232,7 +230,7 @@ build_regexp_list(int names, char **namelist)
 	{
 		if (regcomp(&reglist[i], namelist[i], flag) != 0) 
 		{
-			fprintf(stderr, _("Bad regular expression: %s\n"), namelist[i]);
+			fprintf(stderr, _("killall: Bad regular expression: %s\n"), namelist[i]);
 			exit (1);
 		}
 	}
@@ -331,7 +329,7 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
     pgids = NULL;		/* silence gcc */
   else
     {
-      pgids = malloc (pids * sizeof (pid_t));
+      pgids = calloc (pids, sizeof (pid_t));
       if (!pgids)
 	{
 	  perror ("malloc");
@@ -375,15 +373,15 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
       }
       if ( younger_than || older_than ) {
 	 rewind(file);
-	 unsigned int proc_stt_jf = 0;
-	 okay = fscanf(file, "%*d %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %ull", 
+	 unsigned long long proc_stt_jf = 0;
+	 okay = fscanf(file, "%*d %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %Lu", 
 		       &proc_stt_jf) == 1;
 	 if (!okay) {
 	    fclose(file);
 	    continue;
 	 }
 	 process_age_sec = process_age(proc_stt_jf);
-	 assert(process_age_sec > 0);
+	 assert(process_age_sec >= 0L);
       }
       (void) fclose (file);
        
@@ -443,8 +441,8 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 	  if (exact && !okay)
 	    {
 	      if (verbose)
-		fprintf (stderr, _("skipping partial match %s(%d)\n"), comm,
-			 pid_table[i]);
+		fprintf (stderr, _("killall: skipping partial match %s(%d)\n"),
+			comm, pid_table[i]);
 	      continue;
 	    }
 	  got_long = okay;
@@ -511,11 +509,14 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 		      /* maybe the binary has been modified and std[j].st_ino
 		       * is not reliable anymore. We need to compare paths.
 		       */
-		      char linkbuf[PATH_MAX];
+		      size_t len = strlen(namelist[j]);
+		      char *linkbuf = malloc(len + 1);
 
-		      if (readlink(path, linkbuf, sizeof(linkbuf)) <= 0 ||
-					  strcmp(namelist[j], linkbuf))
+		      if (!linkbuf ||
+			  readlink(path, linkbuf, len + 1) != len ||
+			  memcmp(namelist[j], linkbuf, len))
 			ok = 0;
+		      free(linkbuf);
 		    }
 
 		  free(path);
@@ -541,8 +542,8 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 	    pgids[i] = id;
 	    if (id < 0)
 	      {
-	        fprintf (stderr, "getpgid(%d): %s\n", pid_table[i],
-		   strerror (errno));
+	        fprintf (stderr, "killall: getpgid(%d): %s\n",
+			   pid_table[i], strerror (errno));
 	      }
 	    for (j = 0; j < i; j++)
 	      if (pgids[j] == id)
@@ -552,14 +553,7 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 	  }	
 	if (interactive && !ask (comm, id, signal))
 	  continue;
-	if (pidof)
-	  {
-	    if (found)
-	       putchar (' ');
-	    printf ("%d", id);
-	    found |= 1 << (found_name >= 0 ? found_name : 0);
-	  }
-	else if (kill (process_group ? -id : id, signal) >= 0)
+	if (kill (process_group ? -id : id, signal) >= 0)
 	  {
 	    if (verbose)
 	      fprintf (stderr, _("Killed %s(%s%d) with signal %d\n"), got_long ? command :
@@ -573,12 +567,10 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 	  fprintf (stderr, "%s(%d): %s\n", got_long ? command :
 	    	comm, id, strerror (errno));
     }
-  if (!quiet && !pidof)
+  if (!quiet)
     for (i = 0; i < names; i++)
       if (!(found & (1 << i)))
 	fprintf (stderr, _("%s: no process found\n"), namelist[i]);
-  if (pidof)
-    putchar ('\n');
   if (names)
     /* killall returns a zero return code if at least one process has 
      * been killed for each listed command. */
@@ -611,20 +603,7 @@ kill_all (int signal, int names, char **namelist, struct passwd *pwent)
 
 
 static void
-usage_pidof (void)
-{
-  fprintf (stderr, _(
-    "Usage: pidof [ -eg ] NAME...\n"
-    "       pidof -V\n\n"
-    "    -e      require exact match for very long names;\n"
-    "            skip if the command line is unavailable\n"
-    "    -g      show process group ID instead of process ID\n"
-    "    -V      display version information\n\n"));
-}
-
-
-static void
-usage_killall (const char *msg)
+usage (const char *msg)
 {
   if (msg != NULL)
     fprintf(stderr, "%s\n", msg);
@@ -658,29 +637,31 @@ usage_killall (const char *msg)
     "                      (must precede other arguments)\n"));
 #endif /*WITH_SELINUX*/
   fputc('\n', stderr);
+  exit(1);
 }
 
-
-static void
-usage (const char *msg)
-{
-  if (pidof)
-    usage_pidof ();
-  else
-    usage_killall (msg);
-  exit (1);
-}
 
 void print_version()
 {
-  fprintf(stderr, "%s (PSmisc) %s\n", pidof ? "pidof" : "killall", VERSION);
+  fprintf(stderr, "killall (PSmisc) %s\n", VERSION);
   fprintf(stderr, _(
-    "Copyright (C) 1993-2005 Werner Almesberger and Craig Small\n\n"));
+    "Copyright (C) 1993-2012 Werner Almesberger and Craig Small\n\n"));
   fprintf(stderr, _(
     "PSmisc comes with ABSOLUTELY NO WARRANTY.\n"
     "This is free software, and you are welcome to redistribute it under\n"
     "the terms of the GNU General Public License.\n"
     "For more information about these matters, see the files named COPYING.\n"));
+}
+
+static int
+have_proc_self_stat (void)
+{
+  char filename[128];
+  struct stat isproc;
+  pid_t pid = getpid();
+
+  snprintf(filename, sizeof(filename), PROC_BASE"/%d/stat", (int) pid);
+  return stat(filename, &isproc) == 0;
 }
 
 int
@@ -691,7 +672,6 @@ main (int argc, char **argv)
   int optc;
   int myoptind;
   struct passwd *pwent = NULL;
-  struct stat isproc;
   char yt[16];
   char ot[16];
 
@@ -735,7 +715,6 @@ main (int argc, char **argv)
     name++;
   else
     name = *argv;
-  pidof = strcmp (name, "killall");
   sig_num = SIGTERM;
 
 
@@ -753,50 +732,43 @@ main (int argc, char **argv)
       process_group = 1;
       break;
     case 'y':
-      NOT_PIDOF_OPTION;
       strncpy(yt, optarg, 16);
+	  yt[15] = '\0';
       if ( 0 >= (younger_than = parse_time_units(yt) ) )
 	    usage(_("Invalid time format"));
       break;
     case 'o':
-      NOT_PIDOF_OPTION;
       strncpy(ot, optarg, 16);
+	  ot[15] = '\0';
       if ( 0 >= (older_than = parse_time_units(ot) ) )
 	    usage(_("Invalid time format"));
       break;
     case 'i':
-      NOT_PIDOF_OPTION;
       interactive = 1;
       break;
     case 'l':
-      NOT_PIDOF_OPTION;
       list_signals();
       return 0;
       break;
     case 'q':
-      NOT_PIDOF_OPTION;
       quiet = 1;
       break;
     case 'r':
-      NOT_PIDOF_OPTION;
 	  reg = 1;
 	  break;
     case 's':
 	  sig_num = get_signal (optarg, "killall");
       break;
     case 'u':
-      NOT_PIDOF_OPTION;
       if (!(pwent = getpwnam(optarg))) {
         fprintf (stderr, _("Cannot find user %s\n"), optarg);
         exit (1);
       }
       break;
     case 'v':
-      NOT_PIDOF_OPTION;
       verbose = 1;
       break;
     case 'w':
-      NOT_PIDOF_OPTION;
       wait_until_dead = 1;
       break;
     case 'I':
@@ -804,7 +776,6 @@ main (int argc, char **argv)
       if (strcmp(argv[optind-1],"-I") == 0 || strncmp(argv[optind-1],"--",2) == 0) {
         ignore_case = 1;
       } else {
-        NOT_PIDOF_OPTION;
 	      sig_num = get_signal (argv[optind]+1, "killall");
       }
       break;
@@ -814,7 +785,6 @@ main (int argc, char **argv)
         print_version();
         return 0;
       }
-      NOT_PIDOF_OPTION;
 	    sig_num = get_signal (argv[optind]+1, "killall");
       break;
 #ifdef WITH_SELINUX
@@ -853,12 +823,14 @@ main (int argc, char **argv)
 #endif
     usage(NULL);
 
-  if (argc - myoptind > MAX_NAMES + 1) {
-    fprintf (stderr, _("Maximum number of names is %d\n"), MAX_NAMES);
+  if (argc - myoptind > MAX_NAMES) {
+    fprintf (stderr, _("killall: Maximum number of names is %d\n"),
+	   MAX_NAMES);
     exit (1);
   }
-  if (stat("/proc/self/stat", &isproc)==-1) {
-    fprintf (stderr, _("%s is empty (not mounted ?)\n"), PROC_BASE);
+  if (!have_proc_self_stat()) {
+    fprintf (stderr, _("killall: %s lacks process entries (not mounted ?)\n"),
+		PROC_BASE);
     exit (1);
   }
   argv = argv + myoptind;

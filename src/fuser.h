@@ -1,6 +1,6 @@
 
 /* Option Flags */
-typedef unsigned char opt_type;
+typedef unsigned short opt_type;
 
 #define OPT_VERBOSE 1
 #define OPT_ALLFILES 2
@@ -10,6 +10,7 @@ typedef unsigned char opt_type;
 #define OPT_SILENT 32
 #define OPT_USER 64
 #define OPT_ISMOUNTPOINT 128
+#define OPT_WRITE 256
 
 struct procs {
 	pid_t pid;
@@ -84,6 +85,17 @@ struct mount_list {
 	char *mountpoint;
 	struct mount_list *next;
 };
+
+#if defined (__GNUC__) && defined(__OPTIMIZE__) && !defined (__CYGWIN__)
+# include "lists.h"
+typedef struct mntinfo_s {
+    list_t   this;
+    int id, parid;
+    dev_t     dev;
+    size_t   nlen;
+    char  *mpoint;
+} mntinfo_t;
+#endif
 
 #define NAMESPACE_FILE 0
 #define NAMESPACE_TCP 1

@@ -1,4 +1,4 @@
-.TH KILLALL 1 2009-12-18 "Linux" "User Commands"
+.TH KILLALL 1 2012-06-16 "Linux" "User Commands"
 .SH NAME
 killall \- kill processes by name
 .SH SYNOPSIS
@@ -91,7 +91,7 @@ any of the killed processes still exist and only returns if none are left.
 Note that \fBkillall\fP may wait forever if the signal was ignored, had no
 effect, or if the process stays in zombie state.
 .IP "\fB\-y\fP, \fB\-\-younger\-than\fP"
-Match only processes that are older (started after) the time specified.
+Match only processes that are younger (started after) the time specified.
 The time is specified as a float then a unit. The units are s,m,h,d,w,M,y for
 seconds, minutes, hours, days, weeks, Months and years respectively.
 .IP "\fB\-Z\fP, \fB\-\-context\fP"
@@ -115,9 +115,14 @@ a new process with the same PID between scans.
 .PP
 If processes change their name, \fBkillall\fP may not be able to match 
 them correctly.
+.PP
+\fBkillall\fP has a limit of names that can be specified on the command line. 
+This figure is the size of an unsigned long multiplied by 8. For most 32
+bit systems the limit is 32 and similarly for a 64 bit system the limit is 
+usually 64.
 .SH AUTHORS
 Werner Almesberger <werner@almesberger.net> wrote the original version
-of psmisc. Since version 20 Craig Small <csmall@small.dropbear.id.au>
+of psmisc. Since version 20 Craig Small <csmall@enc.com.au>
 can be blamed.
 .SH "SEE ALSO"
 .BR kill "(1), " fuser "(1), " pgrep "(1), " pidof "(1), " pkill "(1), "
