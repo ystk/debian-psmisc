@@ -1,4 +1,4 @@
-.TH FUSER 1 2009-11-23 "Linux" "User Commands"
+.TH FUSER 1 2011-06-19 "Linux" "User Commands"
 .SH NAME
 fuser \- identify processes using files or sockets
 .SH SYNOPSIS
@@ -12,6 +12,7 @@ fuser \- identify processes using files or sockets
 .RB [ \-k
 .RB [ \-i ]
 .RB [ \-M ]
+.RB [ \-w ]
 .RB [ \- \fISIGNAL
 ] ]
 .IR name " ..."
@@ -96,6 +97,10 @@ Request will be fulfilled only if \fINAME\fR specifies a mountpoint.
 This is an invaluable seatbelt which prevents you from killing the machine
 if \fINAME\fR happens to not be a filesystem.
 .TP
+\fB\-w\fP
+Kill only processes which have write access. This option is
+silently ignored if \fB\-k\fP is not present too.
+.TP
 \fB\-n \fISPACE\fR, \fB\-\-namespace\fR \fISPACE\fR
 Select a different name space. The name spaces \fBfile\fR (file names, the
 default), \fBudp\fR (local UDP ports), and \fBtcp\fR (local TCP ports) are
@@ -164,9 +169,6 @@ reasons.
 .PP
 \fBudp\fR and \fBtcp\fR name spaces, and UNIX domain sockets can't be
 searched with kernels older than 1.3.78.
-.PP
-\fBudp\fR and \fBtcp\fR currently  work with IPv6 and IPv4, but the
-address fields can only be IPv4 addresses.
 .PP
 Accesses by the kernel are only shown with the \fB\-v\fR option.
 .PP

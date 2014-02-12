@@ -4,7 +4,7 @@
  * Based on fuser.c Copyright (C) 1993-2005 Werner Almesberger and Craig Small
  *
  * Completely re-written
- * Copyright (C) 2005-2010 Craig Small
+ * Copyright (C) 2005-2011 Craig Small
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -32,9 +32,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <pwd.h>
@@ -45,6 +47,13 @@
 #include <mntent.h>
 #include <signal.h>
 #include <getopt.h>
+#include <setjmp.h>
+#include <limits.h>
+/* MAXSYMLINKS is a BSDism.  If it doesn't exist, fall back to SYMLINK_MAX,
+   which is the POSIX name. */
+#ifndef MAXSYMLINKS
+#define MAXSYMLINKS SYMLINK_MAX
+#endif
 
 #include "fuser.h"
 #include "signals.h"
@@ -71,7 +80,7 @@ static struct stat *get_pidstat(const pid_t pid, const char *filename);
 static uid_t getpiduid(const pid_t pid);
 static int print_matches(struct names *names_head, const opt_type opts,
 			 const int sig_number);
-static void kill_matched_proc(struct procs *pptr, const opt_type opts,
+static int kill_matched_proc(struct procs *pptr, const opt_type opts,
 			      const int sig_number);
 
 /*int parse_mount(struct names *this_name, struct device_list **dev_list);*/
@@ -95,6 +104,24 @@ static void debug_match_lists(struct names *names_head,
 			      struct device_list *dev_head);
 #endif
 
+#ifdef _LISTS_H
+static void clear_mntinfo(void) __attribute__((__destructor__));
+static void init_mntinfo(void) __attribute__((__constructor__));
+static dev_t device(const char *path);
+#endif
+static char *expandpath(const char *path);
+
+#ifdef WITH_TIMEOUT_STAT
+# if (WITH_TIMEOUT_STAT == 2)
+#  include "timeout.h"
+# else
+typedef int (*stat_t)(const char*, struct stat*);
+static int timeout(stat_t func, const char *path, struct stat *buf, unsigned int seconds);
+# endif
+#else
+#define timeout(func,path,buf,dummy) (func)((path),(buf))
+#endif /* WITH_TIMEOUT_STAT */
+
 static void usage(const char *errormsg)
 {
 	if (errormsg != NULL)
@@ -102,7 +129,7 @@ static void usage(const char *errormsg)
 
 	fprintf(stderr,
 		_
-		("Usage: fuser [-fMuv] [-a|-s] [-4|-6] [-c|-m|-n SPACE] [-k [-i] [-SIGNAL]] NAME...\n"
+		("Usage: fuser [-fMuvw] [-a|-s] [-4|-6] [-c|-m|-n SPACE] [-k [-i] [-SIGNAL]] NAME...\n"
 		 "       fuser -l\n" "       fuser -V\n"
 		 "Show which processes use the named files, sockets, or filesystems.\n\n"
 		 "  -a,--all              display unused files too\n"
@@ -116,6 +143,7 @@ static void usage(const char *errormsg)
 		 "  -SIGNAL               send this signal instead of SIGKILL\n"
 		 "  -u,--user             display user IDs\n"
 		 "  -v,--verbose          verbose output\n"
+		 "  -w,--writeonly        kill only processes with write access\n"
 		 "  -V,--version          display version information\n"));
 #ifdef WITH_IPV6
 	fprintf(stderr, _(
@@ -148,17 +176,10 @@ scan_procs(struct names *names_head, struct inode_list *ino_head,
 {
 	DIR *topproc_dir;
 	struct dirent *topproc_dent;
-	char *fd_dirpath, *fd_pathname;
 	struct inode_list *ino_tmp;
 	struct device_list *dev_tmp;
 	pid_t pid, my_pid;
 	uid_t uid;
-	struct stat *cwd_stat, *exe_stat, *root_stat;
-
-	if ((fd_dirpath = malloc(MAX_PATHNAME)) == NULL)
-		return;
-	if ((fd_pathname = malloc(MAX_PATHNAME)) == NULL)
-		return;
 
 	if ((topproc_dir = opendir("/proc")) == NULL) {
 		fprintf(stderr, _("Cannot open /proc directory: %s\n"),
@@ -167,6 +188,15 @@ scan_procs(struct names *names_head, struct inode_list *ino_head,
 	}
 	my_pid = getpid();
 	while ((topproc_dent = readdir(topproc_dir)) != NULL) {
+		dev_t cwd_dev, exe_dev, root_dev;
+		struct stat *cwd_stat = NULL;
+		struct stat *exe_stat = NULL;
+		struct stat *root_stat = NULL;
+#ifdef _LISTS_H
+		char path[256] = "/proc/", *slash;
+		ssize_t len;
+#endif
+
 		if (topproc_dent->d_name[0] < '0' || topproc_dent->d_name[0] > '9')	/* Not a process */
 			continue;
 		pid = atoi(topproc_dent->d_name);
@@ -175,54 +205,72 @@ scan_procs(struct names *names_head, struct inode_list *ino_head,
 			continue;
 		uid = getpiduid(pid);
 
-		root_stat = get_pidstat(pid, "root");
+#ifdef _LISTS_H
+		strcpy(&path[6], topproc_dent->d_name);
+		len = strlen(path);
+		slash = &path[len];
+
+		*slash = '\0';
+		strcat(slash, "/cwd");
+		cwd_dev = device(path);
+
+		*slash = '\0';
+		strcat(slash, "/exe");
+		exe_dev = device(path);
+
+		*slash = '\0';
+		strcat(slash, "/root");
+		root_dev = device(path);
+#else
 		cwd_stat = get_pidstat(pid, "cwd");
 		exe_stat = get_pidstat(pid, "exe");
-		/* Scan the devices */
-		for (dev_tmp = dev_head; dev_tmp != NULL;
-		     dev_tmp = dev_tmp->next) {
-			if (exe_stat != NULL
-			    && exe_stat->st_dev == dev_tmp->device)
-				add_matched_proc(dev_tmp->name, pid, uid,
-						 ACCESS_EXE);
-			if (root_stat != NULL
-			    && root_stat->st_dev == dev_tmp->device)
-				add_matched_proc(dev_tmp->name, pid, uid,
-						 ACCESS_ROOT);
-			if (cwd_stat != NULL
-			    && cwd_stat->st_dev == dev_tmp->device)
-				add_matched_proc(dev_tmp->name, pid, uid,
-						 ACCESS_CWD);
-		}
-		for (ino_tmp = ino_head; ino_tmp != NULL;
-		     ino_tmp = ino_tmp->next) {
-			if (exe_stat != NULL) {
-				if (exe_stat->st_dev == ino_tmp->device
-				    && exe_stat->st_ino == ino_tmp->inode) {
-					add_matched_proc(ino_tmp->name, pid,
-							 uid, ACCESS_EXE);
-				}
-			}
-			if (root_stat != NULL) {
-				if (root_stat->st_dev == ino_tmp->device
-				    && root_stat->st_ino == ino_tmp->inode) {
-					add_matched_proc(ino_tmp->name, pid,
-							 uid, ACCESS_ROOT);
-				}
+		root_stat = get_pidstat(pid, "root");
+		cwd_dev = cwd_stat ? cwd_stat->st_dev : 0;
+		exe_dev = exe_stat ? exe_stat->st_dev : 0;
+		root_dev = root_stat ? root_stat->st_dev : 0;
+#endif
 
+		/* Scan the devices */
+		for (dev_tmp = dev_head; dev_tmp != NULL; dev_tmp = dev_tmp->next) {
+			if (exe_dev == dev_tmp->device)
+				add_matched_proc(dev_tmp->name, pid, uid, ACCESS_EXE);
+			if (root_dev == dev_tmp->device)
+				add_matched_proc(dev_tmp->name, pid, uid, ACCESS_ROOT);
+			if (cwd_dev == dev_tmp->device)
+				add_matched_proc(dev_tmp->name, pid, uid, ACCESS_CWD);
+		}
+		for (ino_tmp = ino_head; ino_tmp != NULL; ino_tmp = ino_tmp->next) {
+			if (exe_dev == ino_tmp->device) {
+				if (!exe_stat)
+					exe_stat = get_pidstat(pid, "exe");
+				if (exe_stat && exe_stat->st_dev == ino_tmp->device
+					     && exe_stat->st_ino == ino_tmp->inode)
+					add_matched_proc(ino_tmp->name, pid, uid, ACCESS_EXE);
 			}
-			if (cwd_stat != NULL) {
-				if (cwd_stat->st_dev == ino_tmp->device
-				    && cwd_stat->st_ino == ino_tmp->inode) {
-					add_matched_proc(ino_tmp->name, pid,
-							 uid, ACCESS_CWD);
-				}
+			if (root_dev == ino_tmp->device) {
+				if (!root_stat)
+					root_stat = get_pidstat(pid, "root");
+				if (root_stat && root_stat->st_dev == ino_tmp->device
+					      && root_stat->st_ino == ino_tmp->inode)
+					add_matched_proc(ino_tmp->name, pid, uid, ACCESS_ROOT);
+			}
+			if (cwd_dev == ino_tmp->device) {
+				if (!cwd_stat)
+					cwd_stat = get_pidstat(pid, "cwd");
+				if (cwd_stat && cwd_stat->st_dev == ino_tmp->device
+					     && cwd_stat->st_ino == ino_tmp->inode)
+					add_matched_proc(ino_tmp->name, pid, uid, ACCESS_CWD);
 			}
 		}
+		if (root_stat) free(root_stat);
+		if (cwd_stat)  free(cwd_stat);
+		if (exe_stat)  free(exe_stat);
+#if !defined (__linux__) && !defined (__CYGWIN__)
 		check_dir(pid, "lib", dev_head, ino_head, uid, ACCESS_MMAP,
 			  sockets, netdev);
 		check_dir(pid, "mmap", dev_head, ino_head, uid, ACCESS_MMAP,
 			  sockets, netdev);
+#endif
 		check_dir(pid, "fd", dev_head, ino_head, uid, ACCESS_FILE,
 			  sockets, netdev);
 		check_map(pid, "maps", dev_head, ino_head, uid, ACCESS_MMAP);
@@ -237,10 +285,9 @@ add_inode(struct inode_list **ino_list, struct names *this_name,
 {
 	struct inode_list *ino_tmp, *ino_head;
 
-	ino_head = *ino_list;
-
-	if ((ino_tmp = malloc(sizeof(struct inode_list))) == NULL)
+	if ((ino_tmp = (struct inode_list*)malloc(sizeof(struct inode_list))) == NULL)
 		return;
+	ino_head = *ino_list;
 	ino_tmp->name = this_name;
 	ino_tmp->device = device;
 	ino_tmp->inode = inode;
@@ -254,10 +301,10 @@ add_device(struct device_list **dev_list, struct names *this_name, dev_t device)
 	struct device_list *dev_tmp, *dev_head;
 
 	/*printf("Adding device %s %d\n", this_name->filename, device); */
-	dev_head = *dev_list;
 
-	if ((dev_tmp = malloc(sizeof(struct device_list))) == NULL)
+	if ((dev_tmp = (struct device_list*)malloc(sizeof(struct device_list))) == NULL)
 		return;
+	dev_head = *dev_list;
 	dev_tmp->name = this_name;
 	dev_tmp->device = device;
 	dev_tmp->next = dev_head;
@@ -271,10 +318,9 @@ add_ip_conn(struct ip_connections **ip_list, const char *protocol,
 {
 	struct ip_connections *ip_tmp, *ip_head;
 
-	ip_head = *ip_list;
-
-	if ((ip_tmp = malloc(sizeof(struct ip_connections))) == NULL)
+	if ((ip_tmp = (struct ip_connections*)malloc(sizeof(struct ip_connections))) == NULL)
 		return;
+	ip_head = *ip_list;
 	ip_tmp->name = this_name;
 	ip_tmp->lcl_port = lcl_port;
 	ip_tmp->rmt_port = rmt_port;
@@ -292,10 +338,9 @@ add_ip6_conn(struct ip6_connections **ip_list, const char *protocol,
 {
 	struct ip6_connections *ip_tmp, *ip_head;
 
-	ip_head = *ip_list;
-
-	if ((ip_tmp = malloc(sizeof(struct ip6_connections))) == NULL)
+	if ((ip_tmp = (struct ip6_connections*)malloc(sizeof(struct ip6_connections))) == NULL)
 		return;
+	ip_head = *ip_list;
 	ip_tmp->name = this_name;
 	ip_tmp->lcl_port = lcl_port;
 	ip_tmp->rmt_port = rmt_port;
@@ -326,7 +371,7 @@ add_matched_proc(struct names *name_list, const pid_t pid, const uid_t uid,
 		}
 	}
 	/* Not found */
-	if ((pptr = malloc(sizeof(struct procs))) == NULL) {
+	if ((pptr = (struct procs*)malloc(sizeof(struct procs))) == NULL) {
 		fprintf(stderr,
 			_("Cannot allocate memory for matched proc: %s\n"),
 			strerror(errno));
@@ -339,10 +384,13 @@ add_matched_proc(struct names *name_list, const pid_t pid, const uid_t uid,
 	pptr->next = NULL;
 	/* set command name */
 	pptr->command = NULL;
+
+	fp = NULL;
+	pathname = NULL;
 	if ((asprintf(&pathname, "/proc/%d/stat", pid) > 0) &&
 	    ((fp = fopen(pathname, "r")) != NULL) &&
 	    (fscanf(fp, "%*d (%100[^)]", cmdname) == 1))
-		if ((pptr->command = malloc(MAX_CMDNAME + 1)) != NULL) {
+		if ((pptr->command = (char*)malloc(MAX_CMDNAME + 1)) != NULL) {
 			cmdlen = 0;
 			for (cptr = cmdname; cmdlen < MAX_CMDNAME && *cptr;
 			     cptr++) {
@@ -359,6 +407,10 @@ add_matched_proc(struct names *name_list, const pid_t pid, const uid_t uid,
 		name_list->matched_procs = pptr;
 	else
 		last_proc->next = pptr;
+	if (pathname)
+		free(pathname);
+	if (fp)
+		fclose(fp);
 }
 
 /* Adds a knfsd etc process */
@@ -366,11 +418,9 @@ static void
 add_special_proc(struct names *name_list, const char ptype, const uid_t uid,
 		 const char *command)
 {
-	struct procs *pptr, *last_proc;
+	struct procs *pptr;
 
-	last_proc = NULL;
 	for (pptr = name_list->matched_procs; pptr != NULL; pptr = pptr->next) {
-		last_proc = pptr;
 		if (pptr->proc_type == ptype)
 			return;
 	}
@@ -391,9 +441,24 @@ add_special_proc(struct names *name_list, const char ptype, const uid_t uid,
 	pptr->command = strdup(command);
 }
 
-int parse_file(struct names *this_name, struct inode_list **ino_list)
+int parse_file(struct names *this_name, struct inode_list **ino_list, const char opts)
 {
-	if (stat(this_name->filename, &(this_name->st)) != 0) {
+	char * new = expandpath(this_name->filename);
+	if (new) {
+		if (this_name->filename)
+			free(this_name->filename);
+		this_name->filename = strdup(new);
+	}
+#ifdef _LISTS_H
+	if (opts & OPT_MOUNTS) {
+		this_name->st.st_dev = device(this_name->filename);
+		this_name->st.st_ino = 0;
+		add_inode(ino_list, this_name, this_name->st.st_dev, this_name->st.st_ino);
+		return 0;
+	}
+#endif
+
+	if (timeout(stat, this_name->filename, &(this_name->st), 5) != 0) {
       if (errno == ENOENT)
         fprintf(stderr, _("Specified filename %s does not exist.\n"), this_name->filename);
       else
@@ -680,7 +745,7 @@ find_net_sockets(struct inode_list **ino_list,
 		}
 
 	}
-	return;
+	fclose(fp);
 }
 
 #ifdef WITH_IPV6
@@ -695,12 +760,9 @@ find_net6_sockets(struct inode_list **ino_list,
 	struct in6_addr rmt_addr;
 	unsigned int tmp_addr[4];
 	char rmt_addr6str[INET6_ADDRSTRLEN];
-	struct ip6_connections *head, *tmpptr, *tail;
 	struct ip6_connections *conn_tmp;
 	unsigned long scanned_inode;
 	ino_t inode;
-
-	head = tmpptr = tail = NULL;
 
 	if (snprintf(pathname, 200, "/proc/net/%s6", protocol) < 0)
 		return;
@@ -753,6 +815,7 @@ find_net6_sockets(struct inode_list **ino_list,
 			}
 		}
 	}
+	fclose(fp);
 }
 #endif
 
@@ -845,6 +908,7 @@ int main(int argc, char *argv[])
 		{"silent", 0, NULL, 's'},
 		{"user", 0, NULL, 'u'},
 		{"verbose", 0, NULL, 'v'},
+		{"writeonly", 0, NULL, 'w'},
 		{"version", 0, NULL, 'V'},
 #ifdef WITH_IPV6
 		{"ipv4", 0, NULL, '4'},
@@ -868,7 +932,9 @@ int main(int argc, char *argv[])
 #endif
 
 	netdev = find_net_dev();
+#ifndef __CYGWIN__	/* Cygwin doesn't support /proc/net/unix */
 	fill_unix_cache(&unixsockets);
+#endif
 
     for (argc_cnt = 1; argc_cnt < argc; argc_cnt++) {
       current_argv = argv[argc_cnt];
@@ -926,6 +992,7 @@ int main(int argc, char *argv[])
 			return 0;
 		  case 'm':
 			opts |= OPT_MOUNTS;
+		    read_proc_mounts(&mounts);
 			break;
 		  case 'M':
 			opts |= OPT_ISMOUNTPOINT;
@@ -956,6 +1023,9 @@ int main(int argc, char *argv[])
 			break;
 		  case 'v':
 			opts |= OPT_VERBOSE;
+			break;
+		  case 'w':
+			opts |= OPT_WRITE;
 			break;
 		  case 'V':
 			print_version();
@@ -1028,11 +1098,12 @@ int main(int argc, char *argv[])
 			break;
 		default:	/* FILE */
 			this_name->filename = strdup(current_argv);
-			if (parse_file(this_name, &match_inodes) == 0) {
-              parse_unixsockets(this_name, &match_inodes, unixsockets);
+			if (parse_file(this_name, &match_inodes, opts) == 0) {
 			  if (opts & OPT_MOUNTS)
 				parse_mounts(this_name, &match_devices, opts);
-            }
+			  else
+				parse_unixsockets(this_name, &match_inodes, unixsockets);
+			}
 			break;
 		}
 
@@ -1056,7 +1127,7 @@ int main(int argc, char *argv[])
 	if (ipv4_only && ipv6_only)
 		usage(_
 		      ("You cannot search for only IPv4 and only IPv6 sockets at the same time"));
-	if (!ipv4_only) {
+	if (!ipv6_only) {
 #endif
 		if (tcp_connection_list != NULL)
 			find_net_sockets(&match_inodes, tcp_connection_list,
@@ -1066,7 +1137,7 @@ int main(int argc, char *argv[])
 					 "udp", netdev);
 #ifdef WITH_IPV6
 	}
-	if (!ipv6_only) {
+	if (!ipv4_only) {
 		if (tcp6_connection_list != NULL)
 			find_net6_sockets(&match_inodes, tcp6_connection_list,
 					  "tcp", netdev);
@@ -1100,11 +1171,18 @@ print_matches(struct names *names_head, const opt_type opts,
 	int len = 0;
 	struct passwd *pwent = NULL;
 	int have_match = 0;
-	int name_has_procs;
+	int have_kill = 0;
+	int name_has_procs = 0;
 
 	for (nptr = names_head; nptr != NULL; nptr = nptr->next) {
 		if (opts & OPT_SILENT) {
-			have_match = nptr->matched_procs ? 1 : have_match;
+			for (pptr = nptr->matched_procs; pptr != NULL;
+			     pptr = pptr->next) {
+				if(pptr->proc_type != PTYPE_NORMAL)
+					continue;
+
+				have_match = 1;
+			}
 		} else {	/* We're not silent */
 			if ((opts & OPT_ALLFILES) == 0) {
 				name_has_procs = 0;
@@ -1165,7 +1243,7 @@ print_matches(struct names *names_head, const opt_type opts,
 							pwent->pw_name);
 				}
 				if (pptr->proc_type == PTYPE_NORMAL)
-					printf("%6d", pptr->pid);
+					printf(" %5d", pptr->pid);
 				else
 					printf("kernel");
 				fflush(stdout);
@@ -1240,11 +1318,14 @@ print_matches(struct names *names_head, const opt_type opts,
 			}
 		}		/* be silent */
 		if (opts & OPT_KILL)
-			kill_matched_proc(nptr->matched_procs, opts,
-					  sig_number);
+			have_kill = kill_matched_proc(nptr->matched_procs,
+						      opts, sig_number);
 
 	}			/* next name */
-	return (have_match == 1 ? 0 : 1);
+    if (opts & OPT_KILL)
+        return (have_kill == 1 ? 0 : 1);
+    else
+        return (have_match == 1 ? 0 : 1);
 
 }
 
@@ -1253,13 +1334,14 @@ static struct stat *get_pidstat(const pid_t pid, const char *filename)
 	char pathname[256];
 	struct stat *st;
 
-	if ((st = malloc(sizeof(struct stat))) == NULL)
+	if ((st = (struct stat*)malloc(sizeof(struct stat))) == NULL)
 		return NULL;
 	snprintf(pathname, 256, "/proc/%d/%s", pid, filename);
-	if (stat(pathname, st) != 0)
-		return NULL;
-	else
-		return st;
+	if (timeout(stat, pathname, st, 5) != 0) {
+      free(st);
+	  return NULL;
+    }
+	return st;
 }
 
 static void
@@ -1267,80 +1349,106 @@ check_dir(const pid_t pid, const char *dirname, struct device_list *dev_head,
 	  struct inode_list *ino_head, const uid_t uid, const char access,
 	  struct unixsocket_list *sockets, dev_t netdev)
 {
-	char *dirpath, *filepath;
+	char *dirpath = NULL, *filepath = NULL;
 	DIR *dirp;
 	struct dirent *direntry;
 	struct inode_list *ino_tmp;
 	struct device_list *dev_tmp;
 	struct unixsocket_list *sock_tmp;
 	struct stat st, lst;
+	dev_t thedev;
 
-	if ((dirpath = malloc(MAX_PATHNAME)) == NULL)
-		return;
-	if ((filepath = malloc(MAX_PATHNAME)) == NULL)
-		return;
+	if ((dirpath = (char*)malloc(MAX_PATHNAME)) == NULL)
+		goto out;
+	if ((filepath = (char*)malloc(MAX_PATHNAME)) == NULL)
+		goto out;
 
 	snprintf(dirpath, MAX_PATHNAME, "/proc/%d/%s", pid, dirname);
 	if ((dirp = opendir(dirpath)) == NULL)
-		return;
+		goto out;
 	while ((direntry = readdir(dirp)) != NULL) {
 		if (direntry->d_name[0] < '0' || direntry->d_name[0] > '9')
 			continue;
 
 		snprintf(filepath, MAX_PATHNAME, "/proc/%d/%s/%s",
 			 pid, dirname, direntry->d_name);
-		if (stat(filepath, &st) != 0) {
-			fprintf(stderr, _("Cannot stat file %s: %s\n"),
-				filepath, strerror(errno));
+
+#ifdef _LISTS_H
+		st.st_ino = 0;
+		if ((thedev = device(filepath)) < 0)
+#else
+		if (timeout(stat, filepath, &st, 5) != 0)
+#endif
+		{
+            if (errno != ENOENT) {
+                fprintf(stderr, _("Cannot stat file %s: %s\n"),
+				    filepath, strerror(errno));
+            }
 		} else {
-			if (st.st_dev == netdev) {
+#ifndef _LISTS_H
+			thedev = st.st_dev;
+#endif
+			if (thedev == netdev) {
 				for (sock_tmp = sockets; sock_tmp != NULL;
 				     sock_tmp = sock_tmp->next) {
 					if (sock_tmp->net_inode == st.st_ino) {
 						st.st_ino = sock_tmp->inode;
 						st.st_dev = sock_tmp->dev;
+						thedev = sock_tmp->dev;
 						break;
 					}
 				}
 			}
 			for (dev_tmp = dev_head; dev_tmp != NULL;
 			     dev_tmp = dev_tmp->next) {
-				if (st.st_dev == dev_tmp->device) {
-					if (access == ACCESS_FILE
-					    && (lstat(filepath, &lst) == 0)
-					    && (lst.st_mode & S_IWUSR)) {
-						add_matched_proc(dev_tmp->name,
-								 pid, uid,
-								 ACCESS_FILEWR |
-								 access);
-					} else {
-						add_matched_proc(dev_tmp->name,
-								 pid, uid,
-								 access);
-					}
+				if (thedev != dev_tmp->device)
+					continue;
+				if (access == ACCESS_FILE
+				    && (lstat(filepath, &lst) == 0)
+				    && (lst.st_mode & S_IWUSR)) {
+					add_matched_proc(dev_tmp->name,
+							 pid, uid,
+							 ACCESS_FILEWR |
+							 access);
+				} else {
+					add_matched_proc(dev_tmp->name,
+							 pid, uid,
+							 access);
 				}
 			}
 			for (ino_tmp = ino_head; ino_tmp != NULL;
 			     ino_tmp = ino_tmp->next) {
-				if (st.st_dev == ino_tmp->device
-				    && st.st_ino == ino_tmp->inode) {
-					if (access == ACCESS_FILE
-					    && (lstat(filepath, &lst) == 0)
-					    && (lst.st_mode & S_IWUSR)) {
-						add_matched_proc(ino_tmp->name,
-								 pid, uid,
-								 ACCESS_FILEWR |
-								 access);
-					} else {
-						add_matched_proc(ino_tmp->name,
-								 pid, uid,
-								 access);
-					}
+				if (thedev != ino_tmp->device)
+					continue;
+				if (!st.st_ino && timeout(stat, filepath, &st, 5) != 0) {
+					fprintf(stderr,
+						_("Cannot stat file %s: %s\n"),
+						filepath, strerror(errno));
+					continue;
+				}
+				if (st.st_ino == ino_tmp->inode) {
+				    if (access == ACCESS_FILE
+					&& (lstat(filepath, &lst) == 0)
+					&& (lst.st_mode & S_IWUSR)) {
+					    add_matched_proc(ino_tmp->name,
+							     pid, uid,
+							     ACCESS_FILEWR |
+							     access);
+				    } else {
+					    add_matched_proc(ino_tmp->name,
+							     pid, uid,
+							     access);
+				    }
 				}
 			}
 		}
 	}			/* while fd_dent */
 	closedir(dirp);
+out:
+	if (dirpath)
+		free(dirpath);
+	if (filepath)
+		free(filepath);
 }
 
 static void
@@ -1387,7 +1495,7 @@ static uid_t getpiduid(const pid_t pid)
 
 	if (snprintf(pathname, MAX_PATHNAME, "/proc/%d", pid) < 0)
 		return 0;
-	if (stat(pathname, &st) != 0)
+	if (timeout(stat, pathname, &st, 5) != 0)
 		return 0;
 	return st.st_uid;
 }
@@ -1400,7 +1508,6 @@ void fill_unix_cache(struct unixsocket_list **unixsocket_head)
 {
 	FILE *fp;
 	char line[BUFSIZ];
-	char *scanned_path;
 	int scanned_inode;
 	struct stat st;
 	struct unixsocket_list *newsocket;
@@ -1411,24 +1518,38 @@ void fill_unix_cache(struct unixsocket_list **unixsocket_head)
 		return;
 	}
 	while (fgets(line, BUFSIZ, fp) != NULL) {
+		char * path;
+		char * scanned_path = NULL;
 		if (sscanf(line, "%*x: %*x %*x %*x %*x %*d %d %as",
-			   &scanned_inode, &scanned_path) != 2)
-			continue;
-		if (stat(scanned_path, &st) < 0) {
-			free(scanned_path);
+			   &scanned_inode, &scanned_path) != 2) {
+			if (scanned_path)
+				free(scanned_path);
 			continue;
 		}
-		if ((newsocket =
-		     malloc(sizeof(struct unixsocket_list))) == NULL)
+		if (scanned_path == NULL)
 			continue;
+		path = scanned_path;
+		if (*scanned_path == '@')
+			scanned_path++;
+		if (timeout(stat, scanned_path, &st, 5) < 0) {
+			free(path);
+			continue;
+		}
+		if ((newsocket = (struct unixsocket_list*)
+		     malloc(sizeof(struct unixsocket_list))) == NULL) {
+			free(path);
+			continue;
+		}
 		newsocket->sun_name = strdup(scanned_path);
 		newsocket->inode = st.st_ino;
 		newsocket->dev = st.st_dev;
 		newsocket->net_inode = scanned_inode;
 		newsocket->next = *unixsocket_head;
 		*unixsocket_head = newsocket;
+		free(path);
 	}			/* while */
 
+	fclose(fp);
 }
 
 #ifdef DEBUG
@@ -1484,12 +1605,13 @@ static int ask(const pid_t pid)
 	}			/* while */
 }
 
-static void
+static int
 kill_matched_proc(struct procs *proc_head, const opt_type opts,
 		  const int sig_number)
 {
 	struct procs *pptr;
-  pid_t *mypid;
+  pid_t mypid;
+	int ret = 0;
 
   mypid = getpid();
 
@@ -1498,13 +1620,18 @@ kill_matched_proc(struct procs *proc_head, const opt_type opts,
       continue; /* dont kill myself */
 		if ( pptr->proc_type != PTYPE_NORMAL )
 	    continue;
+		if ((opts & OPT_WRITE) && ((pptr->access & ACCESS_FILEWR) == 0))
+			continue;
 		if ((opts & OPT_INTERACTIVE) && (ask(pptr->pid) == 0))
 		  continue;
 		if ( kill(pptr->pid, sig_number) < 0) {
 			fprintf(stderr, _("Could not kill process %d: %s\n"),
 					pptr->pid, strerror(errno));
+			continue;
 		}
+		ret = 1;
 	}
+	return ret;
 }
 
 static dev_t find_net_dev(void)
@@ -1549,7 +1676,7 @@ scan_knfsd(struct names *names_head, struct inode_list *ino_head,
 		if ((find_space = strpbrk(line, " \t")) == NULL)
 			continue;
 		*find_space = '\0';
-		if (stat(line, &st) != 0) {
+		if (timeout(stat, line, &st, 5) != 0) {
 			continue;
 		}
 		/* Scan the devices */
@@ -1567,6 +1694,7 @@ scan_knfsd(struct names *names_head, struct inode_list *ino_head,
 						 line);
 		}
 	}
+	fclose(fp);
 }
 
 static void
@@ -1592,7 +1720,7 @@ scan_mounts(struct names *names_head, struct inode_list *ino_head,
 		if ((find_space = strchr(find_mountp, ' ')) == NULL)
 			continue;
 		*find_space = '\0';
-		if (stat(find_mountp, &st) != 0) {
+		if (timeout(stat, find_mountp, &st, 5) != 0) {
 			continue;
 		}
 		/* Scan the devices */
@@ -1610,6 +1738,7 @@ scan_mounts(struct names *names_head, struct inode_list *ino_head,
 						 find_mountp);
 		}
 	}
+	fclose(fp);
 }
 
 static void
@@ -1624,7 +1753,7 @@ scan_swaps(struct names *names_head, struct inode_list *ino_head,
 	struct stat st;
 
 	if ((fp = fopen(PROC_SWAPS, "r")) == NULL) {
-		fprintf(stderr, "Cannot open %s\n", PROC_SWAPS);
+		/*fprintf(stderr, "Cannot open %s\n", PROC_SWAPS);*/
 		return;
 	}
 	/* lines are filename   type */
@@ -1638,7 +1767,7 @@ scan_swaps(struct names *names_head, struct inode_list *ino_head,
 			if (*find_space == '\0')
 				continue;
 		}
-		if (stat(line, &st) != 0) {
+		if (timeout(stat, line, &st, 5) != 0) {
 			continue;
 		}
 		/* Scan the devices */
@@ -1656,4 +1785,295 @@ scan_swaps(struct names *names_head, struct inode_list *ino_head,
 						 line);
 		}
 	}
+	fclose(fp);
+}
+
+/*
+ * Execute stat(2) system call with timeout to avoid deadlock
+ * on network based file systems.
+ */
+#if defined(WITH_TIMEOUT_STAT) && (WITH_TIMEOUT_STAT == 1)
+
+static sigjmp_buf jenv;
+
+static void
+sigalarm(int sig)
+{
+	if (sig == SIGALRM)
+		siglongjmp(jenv, 1);
+}
+
+static int
+timeout(stat_t func, const char *path, struct stat *buf, unsigned int seconds)
+{
+	pid_t pid = 0;
+	int ret = 0, pipes[4];
+	ssize_t len;
+ 
+	if (pipe(&pipes[0]) < 0)
+		goto err;
+	switch ((pid = fork ())) {
+	case -1:
+		close(pipes[0]);
+		close(pipes[1]);
+		goto err;
+	case 0:
+		(void) signal(SIGALRM, SIG_DFL);
+		close(pipes[0]);
+		if ((ret = func(path, buf)) == 0)
+			do len = write(pipes[1], buf, sizeof(struct stat));
+			while (len < 0 && errno == EINTR);
+		close(pipes[1]);
+		exit(ret);
+	default:
+		close(pipes[1]);
+		if (sigsetjmp(jenv, 1)) {
+			(void) alarm(0);
+			(void) signal(SIGALRM, SIG_DFL);
+			if (waitpid(0, (int*)0, WNOHANG) == 0)
+				kill(pid, SIGKILL);
+			errno = ETIMEDOUT;
+			seconds = 1;
+			goto err;
+		}
+		(void) signal(SIGALRM, sigalarm);
+		(void) alarm(seconds);
+		if (read(pipes[0], buf, sizeof(struct stat)) == 0) {
+			errno = EFAULT;
+			ret = -1;
+		}
+		(void) alarm(0);
+		(void) signal(SIGALRM, SIG_DFL);
+		close(pipes[0]);
+        waitpid(pid, NULL, 0);
+		break;
+	}
+	return ret;
+err:
+	return -1;
+}
+#endif /* WITH_TIMEOUT_STAT */
+
+#ifdef _LISTS_H
+/*
+ * Use /proc/self/mountinfo of modern linux system to determine
+ * the device numbers of the mount points. Use this to avoid the
+ * stat(2) system call wherever possible.
+ */
+
+static list_t mntinfo = {&mntinfo, &mntinfo};
+
+static void
+clear_mntinfo(void)
+{
+	list_t *ptr, *tmp;
+
+	list_for_each_safe(ptr, tmp, &mntinfo) {
+	    mntinfo_t *mnt = list_entry(ptr, mntinfo_t);
+	    delete(ptr);
+	    free(mnt);
+	}
+}
+
+
+static void
+init_mntinfo(void)
+{
+	char mpoint[PATH_MAX+1];
+	int mid, parid, max = 0;
+	uint maj, min;
+	list_t sort;
+	FILE * mnt;
+	
+	if (!list_empty(&mntinfo))
+		return;
+	if ((mnt = fopen("/proc/self/mountinfo", "r")) == (FILE*)0)
+		return;
+	while (fscanf(mnt, "%i %i %u:%u %*s %s %*[^\n]", &mid, &parid, &maj, &min, &mpoint[0]) == 5) {
+		const size_t nlen = strlen(mpoint);
+		mntinfo_t *restrict mnt;
+		if (posix_memalign((void*)&mnt, sizeof(void*), alignof(mntinfo_t)+(nlen+1)) != 0) {
+			fprintf(stderr, _("Cannot allocate memory for matched proc: %s\n"),
+			strerror(errno));
+			exit(1);
+		}
+		append(mnt, mntinfo);
+		mnt->mpoint = ((char*)mnt)+alignof(mntinfo_t);
+		strcpy(mnt->mpoint, mpoint);
+		mnt->nlen = nlen;
+		mnt->parid = parid;
+		mnt->dev = makedev(maj, min);
+		mnt->id = mid;
+		if (mid > max)
+			max = mid;
+	}
+	fclose(mnt);
+
+	/* Sort mount points accordingly to the reverse mount order */
+	initial(&sort);
+	for (mid = 1; mid <= max; mid++) {
+		list_t *ptr, *tmp;
+		list_for_each_safe(ptr, tmp, &mntinfo) {
+			mntinfo_t *mnt = list_entry(ptr, mntinfo_t);
+			if (mid != mnt->id)
+				continue;
+			move_head(ptr, &sort);
+			break;
+		}
+		list_for_each_safe(ptr, tmp, &mntinfo) {
+			mntinfo_t *mnt = list_entry(ptr, mntinfo_t);
+			if (mid != mnt->parid)
+				continue;
+			move_head(ptr, &sort);
+		}
+	}
+	if (!list_empty(&mntinfo)) {
+#ifdef EBADE
+		errno = EBADE;
+#else
+        errno = ENOENT;
+#endif /* EBADE */
+	}
+	join(&sort, &mntinfo);
+}
+
+/*
+ * Determine device of links below /proc/
+ */
+static dev_t
+device(const char * path)
+{
+	char name[PATH_MAX+1];
+	const char *use;
+	ssize_t nlen;
+	list_t *ptr;
+
+	if ((nlen = readlink(path, name, PATH_MAX)) < 0) {
+		nlen = strlen(path);
+		use = &path[0];
+	} else {
+		name[nlen] = '\0';
+		use = &name[0];
+	}
+
+	if (*use != '/') {		/* special file (socket, pipe, inotify) */
+		struct stat st;
+		if (timeout(stat, path, &st, 5) != 0)
+			return (dev_t)-1;
+		return st.st_dev;
+	}
+
+	list_for_each(ptr, &mntinfo) {
+		mntinfo_t *mnt = list_entry(ptr, mntinfo_t);
+		if (nlen < mnt->nlen)
+			continue;
+		if (mnt->nlen == 1)	/* root fs is the last entry */
+			return mnt->dev;
+		if (use[mnt->nlen] != '\0' && use[mnt->nlen] != '/')
+			continue;
+		if (strncmp(use, mnt->mpoint, mnt->nlen) == 0)
+			return mnt->dev;
+	}
+	return (dev_t)-1;
+}
+#endif /* _LISTS_H */
+
+/*
+ * Somehow the realpath(3) glibc function call, nevertheless
+ * it avoids lstat(2) system calls.
+ */
+static char real[PATH_MAX+1];
+char* expandpath(const char * path)
+{
+	char tmpbuf[PATH_MAX+1];
+	const char *start, *end;
+	char *curr, *dest;
+	int deep = MAXSYMLINKS;
+
+	if (!path || *path == '\0')
+		return (char*)0;
+
+	curr = &real[0];
+
+	if (*path != '/') {
+		if (!getcwd(curr, PATH_MAX))
+			return (char*)0;
+#ifdef HAVE_RAWMEMCHR
+		dest = rawmemchr(curr, '\0');
+#else
+		dest = strchr(curr, '\0');
+#endif
+	} else {
+		*curr = '/';
+		dest = curr + 1;
+	}
+
+	for (start = end = path; *start; start = end) {
+
+		while (*start == '/')
+			++start;
+
+		for (end = start; *end && *end != '/'; ++end)
+			;
+
+		if (end - start == 0)
+			break;
+		else if (end - start == 1 && start[0] == '.') {
+			;
+		} else if (end - start == 2 && start[0] == '.' && start[1] == '.') {
+			if (dest > curr + 1)
+				while ((--dest)[-1] != '/')
+					;
+		} else {
+			char lnkbuf[PATH_MAX+1];
+			size_t len;
+			ssize_t n;
+
+			if (dest[-1] != '/')
+				*dest++ = '/';
+
+			if (dest + (end - start) > curr + PATH_MAX) {
+				errno = ENAMETOOLONG;
+				return (char*)0;
+			}
+
+			dest = mempcpy(dest, start, end - start);
+			*dest = '\0';
+
+			if (deep-- < 0) {
+				errno = ELOOP;
+				return (char*)0;
+			}
+
+			errno = 0;
+			if ((n = readlink(curr, lnkbuf, PATH_MAX)) < 0) {
+				deep = MAXSYMLINKS;
+				if (errno == EINVAL)
+					continue;	/* Not a symlink */
+				return (char*)0;
+			}
+			lnkbuf[n] = '\0';		/* Don't be fooled by readlink(2) */
+
+			len = strlen(end);
+			if ((n + len) > PATH_MAX) {
+				errno = ENAMETOOLONG;
+				return (char*)0;
+			}
+
+			memmove(&tmpbuf[n], end, len + 1);
+			path = end = memcpy(tmpbuf, lnkbuf, n);
+
+			if (lnkbuf[0] == '/')
+			    dest = curr + 1;
+			else if (dest > curr + 1)
+			    while ((--dest)[-1] != '/');
+			
+		}
+	}
+
+	if (dest > curr + 1 && dest[-1] == '/')
+		--dest;
+	*dest = '\0';
+
+	return curr;
 }

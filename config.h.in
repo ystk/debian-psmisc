@@ -38,7 +38,7 @@
 /* Define if the GNU gettext() function is already present or preinstalled. */
 #undef HAVE_GETTEXT
 
-/* Define if you have the iconv() function and it works. */
+/* Define if you have the iconv() function. */
 #undef HAVE_ICONV
 
 /* Define to 1 if you have the <inttypes.h> header file. */
@@ -84,6 +84,9 @@
 
 /* Define to 1 if you have the `nl_langinfo' function. */
 #undef HAVE_NL_LANGINFO
+
+/* Define to 1 if you have the `rawmemchr' function. */
+#undef HAVE_RAWMEMCHR
 
 /* Define to 1 if your system has a GNU libc compatible `realloc' function,
    and to 0 otherwise. */
@@ -138,11 +141,20 @@
 /* Define to 1 if you have the `strtoul' function. */
 #undef HAVE_STRTOUL
 
+/* Define to 1 if `cp0_status' is a member of `struct pt_regs'. */
+#undef HAVE_STRUCT_PT_REGS_CP0_STATUS
+
 /* Define to 1 if `gpr' is a member of `struct pt_regs'. */
 #undef HAVE_STRUCT_PT_REGS_GPR
 
 /* Define to 1 if `orig_gpr3' is a member of `struct pt_regs'. */
 #undef HAVE_STRUCT_PT_REGS_ORIG_GPR3
+
+/* Define to 1 if `regs' is a member of `struct pt_regs'. */
+#undef HAVE_STRUCT_PT_REGS_REGS
+
+/* Define to 1 if `uregs' is a member of `struct pt_regs'. */
+#undef HAVE_STRUCT_PT_REGS_UREGS
 
 /* Define to 1 if `st_rdev' is a member of `struct stat'. */
 #undef HAVE_STRUCT_STAT_ST_RDEV
@@ -242,6 +254,14 @@
 
 /* Use Security-Enhanced Linux features */
 #undef WITH_SELINUX
+
+/* Use timeout on stat calls */
+#undef WITH_TIMEOUT_STAT
+
+/* Enable large inode numbers on Mac OS X 10.5.  */
+#ifndef _DARWIN_USE_64_BIT_INODE
+# define _DARWIN_USE_64_BIT_INODE 1
+#endif
 
 /* Number of bits in a file offset, on hosts where this is settable. */
 #undef _FILE_OFFSET_BITS

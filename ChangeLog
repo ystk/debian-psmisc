@@ -1,3 +1,91 @@
+Changes in 22.19
+================
+	* killall with no args exits again SF #3536526
+
+Changes in 22.18
+================
+	* Added AC_CANONICAL_TARGET for target_os Debian #673485
+	* sed doesn't have [0-9]+ replace with [0-9][0-9]*
+	* assert in killall triggered for small lifetimes Debian #628617
+	* killall MAX_NAMES off by one Debian #677428
+	* Removed remaining parts of pidof
+
+Changes in 22.17
+================
+	* Make it possible to use --enable-timeout-stat as well as
+	  --enable-timeout-stat=static for a static background process which
+	  does the final stat system calls
+	* Do not mix HAVE_TIMEOUT_STAT with WITH_TIMEOUT_STAT
+	* Add timeout.c/timeout.h for static background process which is able
+	  to read the file name from pipe, does the stat(2) system call, and
+	  writes the result back to a pipe.
+	* Really add ASCII null at command string in add_proc() of pstree.c
+	* fuser uses correct timeout_stat define Debian #661723
+	* fuser is not compiled on hurd-i386 Debian #673485
+	* No TEXTRELS in src/lists built as PIE on x86
+	* Fake pstree root for kernels with hidepid turned on
+	* More fixes for Cygwin SF Patch #3511920
+	* pstree can show PGIDs SF Patch #3471056
+
+Changes in 22.16
+================
+	* Use strncpy for COMM_LEN and make it 18 characters to cover brackets
+	  in name.
+	* don't change COMM_LEN, it breaks matching long commands
+	  Debian #661145
+	* Enable some harden AM_CFLAGS by default, use configure option
+	  --disable-harden-flags to not use it.
+
+Changes in 22.15
+================
+	* Really apply patch for SF#31110178 RH#651794, SF#3317431
+	* Conditionally use fork before stat calls SF#3427522
+	* Patch from Corrina Vinschen for compiling on cygwin
+	* Use ENOENT not EBADE for FreeBSD Debian #631566
+	* Fix prstat typos
+	* Stop zombies by using waitpid Ubuntu #876387 by Peter Holik, SF#3429674
+	* Fixed minor older/younger typo in killall.1 thanks to Maikel Linke
+	* Remove doubled content in src/lists.h
+	* Add another 2 for thread brackets in pstree.c
+	* Correct defines for timeout in configure.ac
+
+Changes in 22.14
+================
+	* Fix file descriptor as well as memory leaks in fuser
+	* Strip @ symbol from file names read from /proc/net/unix
+	* Above 2 changes close openSuSE bugs #536209, #529520, and #417841
+	  and provided by Werner Fink
+	* Applied patch from Werner Fink to avoid stat(2) on NFS mounts
+	* Zeros process group memory - Patch by jgorig SF#3152925 RH#666213
+	* fuser -m -s flags work - Patch by jgorig SF#31110178 RH#651794
+	* fuser silent if /proc/swaps not available SF#3072134
+	* ppc 64 support for peekfd by jgorig SF#3166444
+	* jiffies now ULL in killall SF#3138538
+	* pstree can show parents of a process. Patch supplied by Curtis
+	  Hawthorne SF#3135157
+	* killall creates right size buffer instead of MAX_PATH Debian #623425
+	* check for /proc/$$/stat not /proc/self/stat which is not available
+	  on hurd platforms. Same Debian bug as above
+	* fuser understands IPv6 addresses, removed comment in fuser.1 that it
+	  doesn't Debian #609904
+	* fuser -k only returns 0 if you kill something.
+	* fuser doesn't complain if /proc/#/fd disappears SF#3310990
+
+Changes in 22.13
+================
+	* configure patch for x86_64 properly applied SF#3029302 by snowman123
+	* patch configure so pt_regs isn't used on SuperH. Fix by
+	  Nobuhiro Iwamatsu in Debian #588986
+	* Fixed configure.ac so only mipsel not mips compiles peekfd
+
+Changes in 22.12
+================
+	* In fuser, switched the ipv6 and ipv4 checks around Debian #581604
+	* peekfd configure patch for x86_64 SF#2986027
+	* peekfd works with ARM and MIPS thanks to patch by Arnaud Patard
+	* peekfd off-by-one patch applied SF#1948351
+	* pstree -a doesn't segfault on grsec kernels Debian #588152
+
 Changes in 22.11
 ================
 	* Another attempted at killall -SIGNAME Debian #573924
