@@ -1,8 +1,28 @@
-psmisc (22.19-1+deb7u1) testing-proposed-updates; urgency=low
+psmisc (22.21-2) unstable; urgency=medium
 
-  * Backport kFreeBSD pstree patch Closes: #687829
+  * Fixed fuser -M typo Closes: #740275 thanks Brad
 
- -- Craig Small <csmall@debian.org>  Wed, 30 Jan 2013 13:00:23 +1100
+
+ -- Craig Small <csmall@debian.org>  Fri, 28 Feb 2014 21:57:20 +1100
+
+psmisc (22.21-1) unstable; urgency=medium
+
+  * New upstream release
+    - Missing comma in fuser(1) added Closes: #702391
+    - pstree uses COLUMN env variable Closes: #717017
+    - fuser -m and -M flags work either way Closes: #606178
+  * Added Multi-Arch: foreign to control Closes: #698948
+  * Updated to standards version 3.9.5, no changes
+
+ -- Craig Small <csmall@debian.org>  Sun, 16 Feb 2014 22:25:22 +1100
+
+psmisc (22.20-1) unstable; urgency=low
+
+  * New upstream release
+    - pstree sorts properly on names Closes: #682014
+    - pstree finds pid 0 stops looping Closes: #687829
+
+ -- Craig Small <csmall@debian.org>  Thu, 20 Sep 2012 22:19:44 +1000
 
 psmisc (22.19-1) unstable; urgency=medium
 
